@@ -1,0 +1,9 @@
+ereferer/
+**/.env
+**/cookies.json
+**/orders_output.json
+**/__pycache__/
+**/*.pyc
+**/.venv/
+**/*.png
+**/*_dump.html
