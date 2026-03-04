@@ -22,8 +22,8 @@ load_dotenv()
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 CONFIG = {
-    "login_url":        "https://app.linksgarden.com/login",   # à ajuster
-    "orders_url":       "https://app.linksgarden.com/orders",  # à ajuster
+    "login_url":        "https://app.linksgarden.com/login.php",
+    "orders_url":       "https://app.linksgarden.com/publisher-dashboard.php",
     "email":            os.getenv("EMAIL", ""),
     "password":         os.getenv("PASSWORD", ""),
     "cookies_file":     "cookies.json",
@@ -69,27 +69,46 @@ def ensure_logged_in(page, context):
 
 
 def do_login(page):
-    """À adapter selon le formulaire de linksgarden."""
     log.info("Login avec email/password...")
     page.goto(CONFIG["login_url"], wait_until="networkidle")
-    # TODO : inspecter les vrais sélecteurs de linksgarden
-    page.fill('input[type="email"]', CONFIG["email"])
-    page.fill('input[type="password"]', CONFIG["password"])
-    page.click('button[type="submit"]')
+    page.fill('input[name="email"]', CONFIG["email"])
+    page.fill('input[name="password"]', CONFIG["password"])
+    page.click('button[name="login"]')
     page.wait_for_load_state("networkidle", timeout=CONFIG["timeout"])
 
 
 def scrape_orders(page) -> list:
-    """À adapter selon la structure de la page commandes de linksgarden."""
     log.info(f"Navigation vers {CONFIG['orders_url']}")
     page.goto(CONFIG["orders_url"], wait_until="networkidle", timeout=CONFIG["timeout"])
     page.screenshot(path="orders_page.png")
 
-    # TODO : implémenter le scraping une fois les sélecteurs connus
-    orders = [{"status": "todo", "page_url": page.url}]
-    log.warning("Scraping linksgarden non encore implémenté — dump HTML")
-    with open("page_dump.html", "w", encoding="utf-8") as f:
-        f.write(page.content())
+    orders = []
+    # Headers : Id commande | Référence | Date commande | Votre site | Site client | Type | Rédacteur | Gain | État | Infos
+    headers = [th.inner_text().strip() for th in page.query_selector_all("table thead th")]
+    rows    = page.query_selector_all("table tbody tr")
+
+    if rows:
+        log.info(f"Tableau trouvé : {len(rows)} lignes")
+        snapshots = []
+        for i, row in enumerate(rows):
+            cells = [td.inner_text().strip() for td in row.query_selector_all("td")]
+            if not any(cells):
+                continue
+            links = [
+                {"text": a.inner_text().strip(), "href": a.get_attribute("href")}
+                for a in row.query_selector_all("a")
+            ]
+            snapshots.append({"index": i, "cells": cells, "links": links})
+
+        for snap in snapshots:
+            order = {"row_index": snap["index"]}
+            for j, h in enumerate(headers):
+                order[h] = snap["cells"][j] if j < len(snap["cells"]) else ""
+            order["links"] = snap["links"]
+            orders.append(order)
+    else:
+        log.info("Aucune commande en cours")
+
     return orders
 
 
