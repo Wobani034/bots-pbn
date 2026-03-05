@@ -6,9 +6,13 @@ Expose /webhook/validate et /webhook/refresh.
 
 import logging
 import threading
+import time
 from flask import Flask, request, jsonify
 
 log = logging.getLogger("core.webhook")
+
+REFRESH_LOCK    = threading.Lock()
+REFRESH_TIMEOUT = 120  # secondes max d'attente si un refresh est déjà en cours
 
 
 def create_app(config: dict, run_fn, validate_fn, notify_fn) -> Flask:
@@ -61,10 +65,22 @@ def create_app(config: dict, run_fn, validate_fn, notify_fn) -> Flask:
         if not check_auth():
             return jsonify({"error": "Unauthorized"}), 401
 
-        # Lance le scraping en arrière-plan pour ne pas bloquer la réponse
-        thread = threading.Thread(target=run_fn, daemon=True)
-        thread.start()
-        log.info("Refresh déclenché via webhook")
+        def run_with_lock():
+            acquired = REFRESH_LOCK.acquire(timeout=REFRESH_TIMEOUT)
+            if not acquired:
+                log.warning("Refresh ignoré : un refresh tourne déjà depuis plus de 2 minutes")
+                return
+            try:
+                log.info("Refresh démarré")
+                run_fn()
+            finally:
+                REFRESH_LOCK.release()
+                log.info("Refresh terminé")
+
+        if REFRESH_LOCK.locked():
+            log.info("Refresh déjà en cours — nouvelle demande mise en attente (max 2 min)")
+
+        threading.Thread(target=run_with_lock, daemon=True).start()
         return jsonify({"status": "started"}), 200
 
     return app
