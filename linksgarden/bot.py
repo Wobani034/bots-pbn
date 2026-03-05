@@ -146,42 +146,14 @@ def run():
     return result
 
 
+def _notify(order_id, published_url, success, message):
+    lovable.notify_validation(order_id, published_url, success, message,
+                              CONFIG["lovable_endpoint"], CONFIG["import_api_key"])
+
+
 def serve():
-    app = Flask(__name__)
-
-    @app.route("/webhook/validate", methods=["POST"])
-    def webhook_validate():
-        auth_header = request.headers.get("Authorization", "")
-        if not CONFIG["import_api_key"] or auth_header != f"Bearer {CONFIG['import_api_key']}":
-            return jsonify({"error": "Unauthorized"}), 401
-
-        data          = request.get_json(silent=True) or {}
-        order_id      = data.get("order_id", "")
-        published_url = data.get("published_url", "")
-
-        if not order_id or not published_url:
-            return jsonify({"error": "order_id et published_url requis"}), 400
-
-        try:
-            result = validate_order(order_id, published_url)
-        except NotImplementedError as e:
-            return jsonify({"error": str(e)}), 501
-        except RuntimeError as e:
-            msg = str(e)
-            log.error(f"Validation #{order_id} : {msg}")
-            lovable.notify_validation(order_id, published_url, False, msg,
-                                      CONFIG["lovable_endpoint"], CONFIG["import_api_key"])
-            return jsonify({"order_id": order_id, "success": False, "message": msg}), 404
-        except Exception as e:
-            msg = f"Erreur inattendue : {e}"
-            log.error(msg)
-            lovable.notify_validation(order_id, published_url, False, msg,
-                                      CONFIG["lovable_endpoint"], CONFIG["import_api_key"])
-            return jsonify({"order_id": order_id, "success": False, "message": msg}), 500
-
-        status_code = 200 if result["success"] else 422
-        return jsonify(result), status_code
-
+    from core.webhook import create_app
+    app  = create_app(CONFIG, run, validate_order, _notify)
     port = int(os.getenv("PORT", 5002))
     log.info(f"Webhook linksgarden démarré sur le port {port}")
     app.run(host="0.0.0.0", port=port)
