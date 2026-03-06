@@ -48,6 +48,117 @@ STATUS_MAP = {
     "Vous devez publier et indiquer l'URL de l'article":          "publish_only",
 }
 
+DOCUMENT_URL_PATTERNS = [
+    r"https?://1drv\.ms/\S+",
+    r"https?://onedrive\.live\.com/\S+",
+    r"https?://docs\.google\.com/\S+",
+    r"https?://drive\.google\.com/\S+",
+]
+
+
+def fetch_document_content(context, url: str) -> str | None:
+    """
+    Tente de récupérer le contenu d'un document partagé (OneDrive, Google Docs).
+    Utilise le context Playwright existant pour éviter les conflits.
+    Retourne du HTML simplifié ou None si échec.
+    """
+    doc_page = None
+    try:
+        doc_page = context.new_page()
+        doc_page.set_default_timeout(30_000)
+        doc_page.goto(url, wait_until="networkidle")
+        doc_page.wait_for_timeout(8_000)
+        html = _extract_word_online(doc_page) or _extract_google_docs(doc_page)
+        return html
+    except Exception as e:
+        log.warning(f"fetch_document_content({url}) échoué : {e}")
+        return None
+    finally:
+        if doc_page:
+            doc_page.close()
+
+
+def _extract_word_online(page) -> str | None:
+    """Extrait le contenu d'un document Word Online (OneDrive)."""
+    word_frame = next(
+        (f for f in page.frames if "wordeditorframe" in f.url), None
+    )
+    if not word_frame:
+        return None
+
+    elements = word_frame.query_selector_all(".OutlineElement")
+    if not elements:
+        return None
+
+    parts = []
+    list_open = False
+
+    for el in elements:
+        text = el.inner_text().strip()
+        if not text:
+            continue
+
+        children_classes = el.evaluate(
+            "el => Array.from(el.querySelectorAll('[class]')).map(c => c.className).join(' ')"
+        )
+
+        # Lien hypertexte dans l'élément
+        links = el.evaluate("""el => {
+            return Array.from(el.querySelectorAll('.Hyperlink')).map(a => ({
+                text: a.innerText.trim(),
+                href: a.querySelector('a') ? a.querySelector('a').href : ''
+            }));
+        }""")
+
+        # Remplace les liens dans le texte
+        for lnk in links:
+            if lnk.get("href") and lnk.get("text"):
+                text = text.replace(lnk["text"], f'<a href="{lnk["href"]}">{lnk["text"]}</a>')
+
+        is_list_item = "ListMarkerWrappingSpan" in children_classes
+        is_heading   = (
+            not is_list_item
+            and len(text) < 100
+            and not text.endswith(".")
+            and not text.endswith(",")
+        )
+
+        if is_list_item:
+            if not list_open:
+                parts.append("<ul>")
+                list_open = True
+            parts.append(f"<li>{text}</li>")
+        else:
+            if list_open:
+                parts.append("</ul>")
+                list_open = False
+            if is_heading:
+                parts.append(f"<h2>{text}</h2>")
+            else:
+                parts.append(f"<p>{text}</p>")
+
+    if list_open:
+        parts.append("</ul>")
+
+    return "\n".join(parts) if parts else None
+
+
+def _extract_google_docs(page) -> str | None:
+    """Extrait le contenu d'un Google Doc."""
+    # Tente l'export HTML direct
+    url = page.url
+    if "docs.google.com/document" in url:
+        doc_id = re.search(r"/document/d/([^/]+)", url)
+        if doc_id:
+            export_url = f"https://docs.google.com/document/d/{doc_id.group(1)}/export?format=html"
+            try:
+                page.goto(export_url, wait_until="networkidle")
+                return page.inner_html("body")
+            except Exception:
+                pass
+    return None
+
+
 AUTO_MESSAGE = (
     "Bonjour,\n\n"
     "Merci pour votre commande. Afin de publier votre article dans les meilleurs délais, "
@@ -132,7 +243,7 @@ def send_message(page, order_id: str, message: str) -> bool:
         return False
 
 
-def scrape_order_detail(page, order_id: str, task_type: str) -> dict:
+def scrape_order_detail(page, context, order_id: str, task_type: str) -> dict:
     """Visite la page de détail d'une offre et en extrait le brief + messages."""
     url = f"https://www.rocketlinks.net/offers/{order_id}"
     log.info(f"  -> Détail offre #{order_id}")
@@ -175,8 +286,24 @@ def scrape_order_detail(page, order_id: str, task_type: str) -> dict:
             page.goto(url, wait_until="networkidle", timeout=CONFIG["timeout"])
             messages = scrape_messages(page)
             auto_sent = True
-        else:
-            # On a déjà demandé → cherche la réponse de l'annonceur après notre message
+
+        # Cherche un lien de document dans tous les messages annonceur
+        for msg in messages:
+            if msg["sender"] != "advertiser":
+                continue
+            for pattern in DOCUMENT_URL_PATTERNS:
+                doc_url_match = re.search(pattern, msg["content"])
+                if doc_url_match:
+                    log.info(f"  -> Lien document trouvé, fetch en cours : {doc_url_match.group()[:60]}")
+                    article_content = fetch_document_content(context, doc_url_match.group())
+                    if article_content:
+                        log.info(f"  -> Contenu récupéré ({len(article_content)} chars)")
+                    break
+            if article_content:
+                break
+
+        # Si pas de lien document : cherche la réponse HTML après notre message auto
+        if not article_content:
             after_auto = False
             for msg in messages:
                 if msg["sender"] == "publisher" and AUTO_MESSAGE_SIGNATURE in msg["content"]:
@@ -197,7 +324,7 @@ def scrape_order_detail(page, order_id: str, task_type: str) -> dict:
     }
 
 
-def scrape_orders(page) -> list:
+def scrape_orders(page, context) -> list:
     log.info(f"Navigation vers {CONFIG['orders_url']}")
     page.goto(CONFIG["orders_url"], wait_until="networkidle", timeout=CONFIG["timeout"])
 
@@ -250,7 +377,7 @@ def scrape_orders(page) -> list:
             "gain":        gain,
         }
 
-        detail = scrape_order_detail(page, order_id, task_type)
+        detail = scrape_order_detail(page, context, order_id, task_type)
         order.update(detail)
 
         orders.append(order)
@@ -348,7 +475,7 @@ def run():
         browser, context, page = new_browser(pw)
         try:
             ensure_logged_in(page, context)
-            orders = scrape_orders(page)
+            orders = scrape_orders(page, context)
         finally:
             browser.close()
 
