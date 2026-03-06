@@ -1,9 +1,10 @@
 """
 core/webhook.py
 Serveur Flask partagé entre tous les bots.
-Expose /webhook/validate et /webhook/refresh.
+Expose /webhook/validate, /webhook/refresh et /webhook/cookies.
 """
 
+import json
 import logging
 import threading
 import time
@@ -17,10 +18,10 @@ REFRESH_TIMEOUT = 120  # secondes max d'attente si un refresh est déjà en cour
 
 def create_app(config: dict, run_fn, validate_fn, notify_fn) -> Flask:
     """
-    Crée l'app Flask avec les deux endpoints.
+    Crée l'app Flask avec les endpoints.
 
     Params:
-        config       : CONFIG du bot (import_api_key, lovable_endpoint...)
+        config       : CONFIG du bot (import_api_key, lovable_endpoint, cookies_file...)
         run_fn       : fonction run() du bot (scraping + envoi Lovable)
         validate_fn  : fonction validate_order(order_id, published_url)
         notify_fn    : fonction notify_lovable_validation(...)
@@ -86,5 +87,48 @@ def create_app(config: dict, run_fn, validate_fn, notify_fn) -> Flask:
 
         threading.Thread(target=run_with_lock, daemon=True).start()
         return jsonify({"status": "started"}), 200
+
+    @app.route("/webhook/cookies", methods=["POST"])
+    def webhook_cookies():
+        """Reçoit des cookies (format browser extension JSON) et les sauvegarde."""
+        if not check_auth():
+            return jsonify({"error": "Unauthorized"}), 401
+
+        data = request.get_json(silent=True)
+        if not data or not isinstance(data, list):
+            return jsonify({"error": "Corps JSON attendu : liste de cookies"}), 400
+
+        # Convertit du format browser extension vers Playwright
+        pw_cookies = []
+        for c in data:
+            pc = {
+                "name":     c.get("name", ""),
+                "value":    c.get("value", ""),
+                "domain":   c.get("domain", ""),
+                "path":     c.get("path", "/"),
+                "httpOnly": c.get("httpOnly", False),
+                "secure":   c.get("secure", False),
+            }
+            if "expirationDate" in c:
+                pc["expires"] = c["expirationDate"]
+            elif "expires" in c:
+                pc["expires"] = c["expires"]
+            ss = c.get("sameSite", "None")
+            ss_map = {"unspecified": "None", "no_restriction": "None",
+                      "lax": "Lax", "strict": "Strict"}
+            pc["sameSite"] = ss_map.get(ss.lower(), "None") if isinstance(ss, str) else "None"
+            pw_cookies.append(pc)
+
+        cookies_file = config.get("cookies_file", "cookies.json")
+        with open(cookies_file, "w") as f:
+            json.dump(pw_cookies, f, indent=2)
+
+        log.info(f"{len(pw_cookies)} cookies reçus et sauvegardés dans {cookies_file}")
+        return jsonify({"status": "ok", "cookies_count": len(pw_cookies)}), 200
+
+    @app.route("/webhook/status", methods=["GET"])
+    def webhook_status():
+        """Endpoint de santé / statut."""
+        return jsonify({"status": "ok"}), 200
 
     return app
