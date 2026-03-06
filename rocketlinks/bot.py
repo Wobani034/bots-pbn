@@ -91,15 +91,24 @@ def _extract_word_online(page) -> tuple[str | None, str | None]:
         return None, None
 
     # Scroll pour déclencher le lazy-loading jusqu'à stabilisation
+    # Word Online rend le contenu au fur et à mesure du scroll dans le conteneur interne
     prev_count = 0
-    for _ in range(15):
+    for _ in range(20):
         elements = word_frame.query_selector_all(".OutlineElement")
         count = len(elements)
         if count == prev_count and count > 0:
             break
         prev_count = count
-        word_frame.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(1500)
+        # Scroll le dernier élément visible dans le viewport pour forcer le rendu suivant
+        word_frame.evaluate("""() => {
+            const els = document.querySelectorAll('.OutlineElement');
+            if (els.length) els[els.length - 1].scrollIntoView({behavior: 'instant', block: 'end'});
+            // Fallback : scroll tous les conteneurs possibles
+            const containers = document.querySelectorAll('#WACViewPanel, .PageContentContainer, .Pages, [class*="Canvas"]');
+            containers.forEach(c => c.scrollTop = c.scrollHeight);
+            window.scrollTo(0, document.body.scrollHeight);
+        }""")
+        page.wait_for_timeout(2000)
 
     elements = word_frame.query_selector_all(".OutlineElement")
     if not elements:
