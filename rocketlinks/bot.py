@@ -189,19 +189,36 @@ def scrape_orders(page) -> list:
     return orders
 
 
+def compute_status(task_type: str, article_content) -> str:
+    """
+    Détermine le statut métier de la commande :
+    - to_write          : on doit rédiger, publier et soumettre l'URL
+    - waiting_for_client: publish_only mais l'article n'a pas encore été envoyé
+    - to_publish        : article reçu du client, prêt à publier et soumettre l'URL
+    """
+    if task_type == "write_and_publish":
+        return "to_write"
+    if task_type == "publish_only":
+        return "to_publish" if article_content else "waiting_for_client"
+    return "unknown"
+
+
 def normalize_order(order: dict) -> dict:
     """Construit le payload Lovable."""
+    task_type       = order.get("task_type", "unknown")
+    article_content = order.get("article_content")
     return {
-        "provider":       "rocketlinks",
-        "order_id":       order["order_id"],
-        "site_url":       order.get("site_url", ""),
-        "gain":           order.get("gain", 0.0),
-        "deadline_days":  order.get("deadline_days"),
-        "task_type":      order.get("task_type", "unknown"),
-        "topic":          order.get("topic", ""),
-        "word_count_min": order.get("word_count_min"),
-        "links_to_add":   order.get("links_to_add", []),
-        "article_content": order.get("article_content"),
+        "provider":        "rocketlinks",
+        "order_id":        order["order_id"],
+        "site_url":        order.get("site_url", ""),
+        "gain":            order.get("gain", 0.0),
+        "deadline_days":   order.get("deadline_days"),
+        "task_type":       task_type,
+        "status":          compute_status(task_type, article_content),
+        "topic":           order.get("topic", ""),
+        "word_count_min":  order.get("word_count_min"),
+        "links_to_add":    order.get("links_to_add", []),
+        "article_content": article_content,
     }
 
 
