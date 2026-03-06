@@ -56,11 +56,10 @@ DOCUMENT_URL_PATTERNS = [
 ]
 
 
-def fetch_document_content(context, url: str) -> str | None:
+def fetch_document_content(context, url: str) -> tuple[str | None, str | None]:
     """
     Tente de récupérer le contenu d'un document partagé (OneDrive, Google Docs).
-    Utilise le context Playwright existant pour éviter les conflits.
-    Retourne du HTML simplifié ou None si échec.
+    Retourne (html, title) ou (None, None) si échec.
     """
     doc_page = None
     try:
@@ -68,61 +67,78 @@ def fetch_document_content(context, url: str) -> str | None:
         doc_page.set_default_timeout(30_000)
         doc_page.goto(url, wait_until="networkidle")
         doc_page.wait_for_timeout(8_000)
-        html = _extract_word_online(doc_page) or _extract_google_docs(doc_page)
-        return html
+        html, title = _extract_word_online(doc_page)
+        if not html:
+            html, title = _extract_google_docs(doc_page)
+        return html, title
     except Exception as e:
         log.warning(f"fetch_document_content({url}) échoué : {e}")
-        return None
+        return None, None
     finally:
         if doc_page:
             doc_page.close()
 
 
-def _extract_word_online(page) -> str | None:
-    """Extrait le contenu d'un document Word Online (OneDrive)."""
+def _extract_word_online(page) -> tuple[str | None, str | None]:
+    """
+    Extrait le contenu d'un document Word Online (OneDrive).
+    Retourne (html, title) ou (None, None) si échec.
+    """
     word_frame = next(
         (f for f in page.frames if "wordeditorframe" in f.url), None
     )
     if not word_frame:
-        return None
+        return None, None
 
     elements = word_frame.query_selector_all(".OutlineElement")
     if not elements:
-        return None
+        return None, None
 
-    parts = []
-    list_open = False
+    # Titre = texte du premier OutlineElement avec role='heading' qui a du contenu
+    # Fallback : page.title() nettoyé (nom du fichier)
+    title = None
+    for el in elements:
+        is_h = el.evaluate("el => !!el.querySelector(\"[role='heading']\")")
+        if is_h:
+            t = el.inner_text().strip() or el.evaluate("el => el.textContent.trim()")
+            if t:
+                title = t
+                break
+    if not title:
+        raw_title = page.title().strip()
+        title = re.sub(r"\.(docx?|gdoc|pdf)$", "", raw_title, flags=re.IGNORECASE).strip() or None
+
+    parts              = []
+    list_open          = False
+    title_skipped      = False
 
     for el in elements:
-        text = el.inner_text().strip()
-        if not text:
-            continue
-
         children_classes = el.evaluate(
             "el => Array.from(el.querySelectorAll('[class]')).map(c => c.className).join(' ')"
         )
+        is_list_item = "ListMarkerWrappingSpan" in children_classes
+        is_heading   = el.evaluate("el => !!el.querySelector(\"[role='heading']\")")
 
-        # Lien hypertexte dans l'élément
-        links = el.evaluate("""el => {
-            return Array.from(el.querySelectorAll('.Hyperlink')).map(a => ({
-                text: a.innerText.trim(),
-                href: a.querySelector('a') ? a.querySelector('a').href : ''
-            }));
-        }""")
+        # Texte : supprime le marqueur de liste (\uf0b7 bullet Word ou "1." numéroté)
+        raw_text = el.inner_text()
+        text     = re.sub(r"^[\uf0b7\u2022•]+\s*", "", raw_text).strip()
+        text     = re.sub(r"^\d+\.\s+", "", text)
+        if not text:
+            continue
 
-        # Remplace les liens dans le texte
+        # Liens hypertexte
+        links = el.evaluate("""el => Array.from(el.querySelectorAll('a')).map(a => ({
+            text: a.innerText.trim(),
+            href: a.href
+        }))""")
         for lnk in links:
             if lnk.get("href") and lnk.get("text"):
                 text = text.replace(lnk["text"], f'<a href="{lnk["href"]}">{lnk["text"]}</a>')
 
-        is_list_item = "ListMarkerWrappingSpan" in children_classes
-        is_heading   = (
-            not is_list_item
-            and len(text) < 100
-            and not text.endswith(".")
-            and not text.endswith(",")
-            and not text.endswith(":")
-        )
+        # Skip le titre principal H1 (déjà dans le champ title)
+        if is_heading and not title_skipped:
+            title_skipped = True
+            continue
 
         if is_list_item:
             if not list_open:
@@ -133,20 +149,16 @@ def _extract_word_online(page) -> str | None:
             if list_open:
                 parts.append("</ul>")
                 list_open = False
-            if is_heading:
-                parts.append(f"<h2>{text}</h2>")
-            else:
-                parts.append(f"<p>{text}</p>")
+            parts.append(f"<h2>{text}</h2>" if is_heading else f"<p>{text}</p>")
 
     if list_open:
         parts.append("</ul>")
 
-    return "\n".join(parts) if parts else None
+    return ("\n".join(parts) if parts else None), title
 
 
-def _extract_google_docs(page) -> str | None:
+def _extract_google_docs(page) -> tuple[str | None, str | None]:
     """Extrait le contenu d'un Google Doc."""
-    # Tente l'export HTML direct
     url = page.url
     if "docs.google.com/document" in url:
         doc_id = re.search(r"/document/d/([^/]+)", url)
@@ -154,10 +166,11 @@ def _extract_google_docs(page) -> str | None:
             export_url = f"https://docs.google.com/document/d/{doc_id.group(1)}/export?format=html"
             try:
                 page.goto(export_url, wait_until="networkidle")
-                return page.inner_html("body")
+                title = page.title()
+                return page.inner_html("body"), title
             except Exception:
                 pass
-    return None
+    return None, None
 
 
 AUTO_MESSAGE = (
@@ -275,6 +288,7 @@ def scrape_order_detail(page, context, order_id: str, task_type: str) -> dict:
 
     # Contenu article : uniquement dans les messages annonceur après notre message auto
     article_content = None
+    article_title   = None
     auto_sent = any(
         AUTO_MESSAGE_SIGNATURE in m["content"]
         for m in messages if m["sender"] == "publisher"
@@ -296,9 +310,9 @@ def scrape_order_detail(page, context, order_id: str, task_type: str) -> dict:
                 doc_url_match = re.search(pattern, msg["content"])
                 if doc_url_match:
                     log.info(f"  -> Lien document trouvé, fetch en cours : {doc_url_match.group()[:60]}")
-                    article_content = fetch_document_content(context, doc_url_match.group())
+                    article_content, article_title = fetch_document_content(context, doc_url_match.group())
                     if article_content:
-                        log.info(f"  -> Contenu récupéré ({len(article_content)} chars)")
+                        log.info(f"  -> Contenu récupéré ({len(article_content)} chars), titre : {article_title}")
                     break
             if article_content:
                 break
@@ -321,6 +335,7 @@ def scrape_order_detail(page, context, order_id: str, task_type: str) -> dict:
         "links_to_add":    links_to_add,
         "messages":        messages,
         "article_content": article_content,
+        "article_title":   article_title,
         "auto_msg_sent":   auto_sent,
     }
 
@@ -419,6 +434,7 @@ def normalize_order(order: dict) -> dict:
         "topic":           order.get("topic", ""),
         "word_count_min":  order.get("word_count_min"),
         "links_to_add":    order.get("links_to_add", []),
+        "article_title":   order.get("article_title"),
         "article_content": article_content,
         "messages":        messages,
     }
