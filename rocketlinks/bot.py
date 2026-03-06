@@ -90,6 +90,17 @@ def _extract_word_online(page) -> tuple[str | None, str | None]:
     if not word_frame:
         return None, None
 
+    # Scroll pour déclencher le lazy-loading jusqu'à stabilisation
+    prev_count = 0
+    for _ in range(15):
+        elements = word_frame.query_selector_all(".OutlineElement")
+        count = len(elements)
+        if count == prev_count and count > 0:
+            break
+        prev_count = count
+        word_frame.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1500)
+
     elements = word_frame.query_selector_all(".OutlineElement")
     if not elements:
         return None, None
@@ -110,6 +121,7 @@ def _extract_word_online(page) -> tuple[str | None, str | None]:
 
     parts              = []
     list_open          = False
+    list_ordered       = False
     title_skipped      = False
 
     for el in elements:
@@ -141,18 +153,31 @@ def _extract_word_online(page) -> tuple[str | None, str | None]:
             continue
 
         if is_list_item:
+            # Détecte si liste numérotée via le texte du ListMarker
+            marker_text = el.evaluate(
+                "el => { const m = el.querySelector('.ListMarker'); return m ? m.innerText.trim() : ''; }"
+            )
+            is_ordered = bool(re.match(r'^\d+', marker_text))
+
+            # Ferme la liste courante si le type change
+            if list_open and list_ordered != is_ordered:
+                parts.append("</ol>" if list_ordered else "</ul>")
+                list_open = False
+
             if not list_open:
-                parts.append("<ul>")
-                list_open = True
+                parts.append("<ol>" if is_ordered else "<ul>")
+                list_open    = True
+                list_ordered = is_ordered
+
             parts.append(f"<li>{text}</li>")
         else:
             if list_open:
-                parts.append("</ul>")
+                parts.append("</ol>" if list_ordered else "</ul>")
                 list_open = False
             parts.append(f"<h2>{text}</h2>" if is_heading else f"<p>{text}</p>")
 
     if list_open:
-        parts.append("</ul>")
+        parts.append("</ol>" if list_ordered else "</ul>")
 
     return ("\n".join(parts) if parts else None), title
 
