@@ -121,6 +121,7 @@ def _extract_word_online(page) -> str | None:
             and len(text) < 100
             and not text.endswith(".")
             and not text.endswith(",")
+            and not text.endswith(":")
         )
 
         if is_list_item:
