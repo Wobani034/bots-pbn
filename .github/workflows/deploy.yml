@@ -19,3 +19,4 @@ jobs:
             cd /opt/scripts/bots-pbn-multi
             git pull
             systemctl restart rocketlinks-webhook
+            systemctl restart collaborator-webhook
