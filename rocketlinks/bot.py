@@ -317,11 +317,29 @@ def scrape_order_detail(page, context, order_id: str, task_type: str) -> dict:
     m = re.search(r"(\d+)\s*jours?\s+et\s+\d+\s*heure", text)
     deadline_days = int(m.group(1)) if m else None
 
-    # Liens à insérer (HTML encodé dans la balise <pre> du brief)
-    brief_el   = page.query_selector(".article-brief")
-    brief_text = brief_el.inner_text() if brief_el else ""
-    raw_links  = re.findall(r'<a\s+href=["\']([^"\']+)["\'][^>]*>([^<]+)</a>', brief_text)
-    links_to_add = [{"href": href, "anchor": anchor.strip()} for href, anchor in raw_links]
+    # Liens à insérer : depuis le HTML du brief (vrais <a>) + texte brut (balises en clair)
+    brief_el     = page.query_selector(".article-brief")
+    links_to_add = []
+    seen_hrefs   = set()
+    if brief_el:
+        # 1) Vrais liens HTML dans le DOM
+        dom_links = brief_el.evaluate("""el => Array.from(el.querySelectorAll('a')).map(a => ({
+            href: a.href, anchor: a.innerText.trim()
+        }))""")
+        for lnk in dom_links:
+            if lnk.get("href") and lnk["href"] not in seen_hrefs:
+                seen_hrefs.add(lnk["href"])
+                links_to_add.append({"href": lnk["href"], "anchor": lnk.get("anchor", "")})
+        # 2) Balises <a> écrites en texte brut dans le brief
+        brief_text = brief_el.inner_text() or ""
+        for href, anchor in re.findall(r'<a\s+href=["\']([^"\']+)["\'][^>]*>([^<]+)</a>', brief_text):
+            if href not in seen_hrefs:
+                seen_hrefs.add(href)
+                links_to_add.append({"href": href, "anchor": anchor.strip()})
+    # Champ HTML prêt à insérer pour Lovable
+    links_html = " ".join(
+        f'<a href="{l["href"]}">{l["anchor"]}</a>' for l in links_to_add
+    ) if links_to_add else ""
 
     # Messages de la discussion
     messages = scrape_messages(page)
@@ -373,6 +391,7 @@ def scrape_order_detail(page, context, order_id: str, task_type: str) -> dict:
         "topic":           topic,
         "deadline_days":   deadline_days,
         "links_to_add":    links_to_add,
+        "links_html":      links_html,
         "messages":        messages,
         "article_content": article_content,
         "article_title":   article_title,
@@ -474,6 +493,7 @@ def normalize_order(order: dict) -> dict:
         "topic":           order.get("topic", ""),
         "word_count_min":  order.get("word_count_min"),
         "links_to_add":    order.get("links_to_add", []),
+        "links_html":      order.get("links_html", ""),
         "article_title":   order.get("article_title"),
         "article_content": article_content,
         "messages":        messages,
