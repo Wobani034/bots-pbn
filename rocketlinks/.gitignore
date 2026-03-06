@@ -1,0 +1,8 @@
+.env
+cookies.json
+orders_output.json
+*.png
+*_dump.html
+__pycache__/
+*.pyc
+.venv/
