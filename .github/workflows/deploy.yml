@@ -18,3 +18,4 @@ jobs:
           script: |
             cd /opt/scripts/bots-pbn-multi
             git pull
+            systemctl restart rocketlinks-webhook
