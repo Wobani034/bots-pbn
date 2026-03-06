@@ -48,6 +48,16 @@ STATUS_MAP = {
     "Vous devez publier et indiquer l'URL de l'article":          "publish_only",
 }
 
+AUTO_MESSAGE = (
+    "Bonjour,\n\n"
+    "Merci pour votre commande. Afin de publier votre article dans les meilleurs délais, "
+    "pourriez-vous me l'envoyer directement dans ce message au format HTML "
+    "(avec les balises h1, h2, p, listes, liens, etc.) "
+    "ou via un lien consultable en ligne (Google Docs, etc.) ?\n\n"
+    "Merci !"
+)
+AUTO_MESSAGE_SIGNATURE = "pourriez-vous me l'envoyer directement dans ce message"
+
 
 def new_browser(pw):
     browser = pw.chromium.launch(headless=CONFIG["headless"])
@@ -81,8 +91,49 @@ def do_login(page):
     page.wait_for_load_state("networkidle", timeout=CONFIG["timeout"])
 
 
-def scrape_order_detail(page, order_id: str) -> dict:
-    """Visite la page de détail d'une offre et en extrait le brief."""
+def scrape_messages(page) -> list:
+    """Extrait tous les messages de la page de détail d'une offre (déjà chargée)."""
+    messages = []
+    for el in page.query_selector_all(".message"):
+        classes    = el.get_attribute("class") or ""
+        sender     = "advertiser" if "advertiserMessage" in classes else "publisher"
+        text       = el.inner_text().strip()
+        # Extrait la date (format "05/03/2026 | 20:36")
+        date_match = re.search(r"(\d{2}/\d{2}/\d{4})\s*\|\s*(\d{2}:\d{2})", text)
+        date       = f"{date_match.group(1)} {date_match.group(2)}" if date_match else ""
+        # Supprime la ligne de date du corps du message
+        body       = re.sub(r"\d{2}/\d{2}/\d{4}\s*\|\s*\d{2}:\d{2}", "", text).strip()
+        body       = re.sub(r"^(Vu|Lu)\n?", "", body).strip()
+        if body:
+            messages.append({"sender": sender, "date": date, "content": body})
+    return messages
+
+
+def send_message(page, order_id: str, message: str) -> bool:
+    """Envoie un message à l'annonceur sur une commande RocketLinks."""
+    log.info(f"  -> Envoi message automatique sur #{order_id}")
+    page.goto(
+        f"https://www.rocketlinks.net/offers/{order_id}",
+        wait_until="networkidle",
+        timeout=CONFIG["timeout"],
+    )
+    try:
+        # Ouvre le formulaire de message
+        page.click("a:has-text('Envoyer un message')", timeout=10_000)
+        page.wait_for_selector("#ConversationMessageConversationTypeId", state="visible", timeout=10_000)
+        page.select_option("#ConversationMessageConversationTypeId", "1")
+        page.fill("#ConversationMessageMessage", message)
+        page.click("#submitButtonMessage")
+        page.wait_for_load_state("networkidle", timeout=CONFIG["timeout"])
+        log.info(f"  -> Message envoyé sur #{order_id}")
+        return True
+    except Exception as e:
+        log.warning(f"  -> Impossible d'envoyer le message sur #{order_id} : {e}")
+        return False
+
+
+def scrape_order_detail(page, order_id: str, task_type: str) -> dict:
+    """Visite la page de détail d'une offre et en extrait le brief + messages."""
     url = f"https://www.rocketlinks.net/offers/{order_id}"
     log.info(f"  -> Détail offre #{order_id}")
     page.goto(url, wait_until="networkidle", timeout=CONFIG["timeout"])
@@ -102,23 +153,47 @@ def scrape_order_detail(page, order_id: str) -> dict:
     deadline_days = int(m.group(1)) if m else None
 
     # Liens à insérer (HTML encodé dans la balise <pre> du brief)
-    brief_el = page.query_selector(".article-brief")
+    brief_el   = page.query_selector(".article-brief")
     brief_text = brief_el.inner_text() if brief_el else ""
-    raw_links = re.findall(r'<a\s+href=["\']([^"\']+)["\'][^>]*>([^<]+)</a>', brief_text)
+    raw_links  = re.findall(r'<a\s+href=["\']([^"\']+)["\'][^>]*>([^<]+)</a>', brief_text)
     links_to_add = [{"href": href, "anchor": anchor.strip()} for href, anchor in raw_links]
 
-    # Contenu article fourni par le client (Type A, si disponible)
+    # Messages de la discussion
+    messages = scrape_messages(page)
+
+    # Contenu article : uniquement dans les messages annonceur après notre message auto
     article_content = None
-    article_el = page.query_selector(".article-content, [class*='article-text'], .content-provided")
-    if article_el:
-        article_content = article_el.inner_text().strip()
+    auto_sent = any(
+        AUTO_MESSAGE_SIGNATURE in m["content"]
+        for m in messages if m["sender"] == "publisher"
+    )
+
+    if task_type == "publish_only":
+        if not auto_sent:
+            # Pas encore demandé → envoyer le message automatique
+            send_message(page, order_id, AUTO_MESSAGE)
+            page.goto(url, wait_until="networkidle", timeout=CONFIG["timeout"])
+            messages = scrape_messages(page)
+            auto_sent = True
+        else:
+            # On a déjà demandé → cherche la réponse de l'annonceur après notre message
+            after_auto = False
+            for msg in messages:
+                if msg["sender"] == "publisher" and AUTO_MESSAGE_SIGNATURE in msg["content"]:
+                    after_auto = True
+                    continue
+                if after_auto and msg["sender"] == "advertiser" and msg["content"]:
+                    article_content = msg["content"]
+                    break
 
     return {
-        "word_count_min": word_count_min,
-        "topic":          topic,
-        "deadline_days":  deadline_days,
-        "links_to_add":   links_to_add,
+        "word_count_min":  word_count_min,
+        "topic":           topic,
+        "deadline_days":   deadline_days,
+        "links_to_add":    links_to_add,
+        "messages":        messages,
         "article_content": article_content,
+        "auto_msg_sent":   auto_sent,
     }
 
 
@@ -147,7 +222,6 @@ def scrape_orders(page) -> list:
 
     orders = []
     for snap in snapshots:
-        # order_id depuis /offers/384254
         offer_link = next(
             (l for l in snap["links"] if l["href"] and l["href"].startswith("/offers/")),
             None,
@@ -176,25 +250,23 @@ def scrape_orders(page) -> list:
             "gain":        gain,
         }
 
-        # Détails du brief
-        detail = scrape_order_detail(page, order_id)
+        detail = scrape_order_detail(page, order_id, task_type)
         order.update(detail)
 
         orders.append(order)
-        log.info(f"Commande #{order_id} ({task_type}) — {site_url} — {gain}€")
+        log.info(f"Commande #{order_id} ({task_type}) — {site_url} — {gain}€ — {len(detail['messages'])} message(s)")
 
-        # Retour à la liste
         page.goto(CONFIG["orders_url"], wait_until="networkidle", timeout=CONFIG["timeout"])
 
     return orders
 
 
-def compute_status(task_type: str, article_content) -> str:
+def compute_status(task_type: str, article_content, messages: list) -> str:
     """
-    Détermine le statut métier de la commande :
-    - to_write          : on doit rédiger, publier et soumettre l'URL
-    - waiting_for_client: publish_only mais l'article n'a pas encore été envoyé
-    - to_publish        : article reçu du client, prêt à publier et soumettre l'URL
+    Détermine le statut métier :
+    - to_write          : on rédige + publie
+    - waiting_for_client: publish_only, message auto envoyé, article pas encore reçu
+    - to_publish        : article reçu du client, prêt à publier
     """
     if task_type == "write_and_publish":
         return "to_write"
@@ -207,6 +279,7 @@ def normalize_order(order: dict) -> dict:
     """Construit le payload Lovable."""
     task_type       = order.get("task_type", "unknown")
     article_content = order.get("article_content")
+    messages        = order.get("messages", [])
     return {
         "provider":        "rocketlinks",
         "order_id":        order["order_id"],
@@ -214,11 +287,12 @@ def normalize_order(order: dict) -> dict:
         "gain":            order.get("gain", 0.0),
         "deadline_days":   order.get("deadline_days"),
         "task_type":       task_type,
-        "status":          compute_status(task_type, article_content),
+        "status":          compute_status(task_type, article_content, messages),
         "topic":           order.get("topic", ""),
         "word_count_min":  order.get("word_count_min"),
         "links_to_add":    order.get("links_to_add", []),
         "article_content": article_content,
+        "messages":        messages,
     }
 
 
@@ -238,12 +312,10 @@ def validate_order(order_id: str, published_url: str) -> dict:
 
             page.fill('input[name="data[Deal][dedicated_page]"]', published_url)
 
-            # Coche la garantie
             guarantee = page.locator('input[name="data[Deal][guarantee]"][type="checkbox"]')
             if guarantee.count() and not guarantee.is_checked():
                 guarantee.check()
 
-            # Coche les CGU
             terms = page.locator('input[name="data[Terms][accept]"]')
             if terms.count() and not terms.is_checked():
                 terms.check()
