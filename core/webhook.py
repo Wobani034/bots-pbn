@@ -58,6 +58,10 @@ def create_app(config: dict, run_fn, validate_fn, notify_fn) -> Flask:
             notify_fn(order_id, published_url, False, msg)
             return jsonify({"order_id": order_id, "success": False, "message": msg}), 500
 
+        # Notifie Lovable du succès de la validation
+        if result.get("success"):
+            notify_fn(order_id, published_url, True, result.get("message", ""))
+
         return jsonify(result), 200 if result["success"] else 422
 
     @app.route("/webhook/refresh", methods=["POST"])

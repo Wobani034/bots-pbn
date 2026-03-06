@@ -217,6 +217,12 @@ AUTO_MESSAGE = (
 )
 AUTO_MESSAGE_SIGNATURE = "pourriez-vous me l'envoyer directement dans ce message"
 
+THANK_YOU_MESSAGE = (
+    "Bonjour,\n\n"
+    "Votre article est bien en ligne, merci de votre confiance !\n\n"
+    "Bonne continuation."
+)
+
 
 def new_browser(pw):
     browser = pw.chromium.launch(headless=CONFIG["headless"])
@@ -509,6 +515,10 @@ def validate_order(order_id: str, published_url: str) -> dict:
                 alert = page.query_selector(".alert-danger, .error, [class*='error']")
                 msg   = alert.inner_text().strip() if alert else text[:300]
                 raise RuntimeError(msg)
+
+            # Message de remerciement après validation réussie
+            if success:
+                send_message(page, order_id, THANK_YOU_MESSAGE)
 
         finally:
             browser.close()
